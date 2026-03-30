@@ -1,4 +1,4 @@
-import { v4 as uuidv4 } from "uuid";
+import { randomUUID } from "crypto";
 import { Reservation, IReservation } from "../models/Reservation";
 import {
   VALID_RESERVATION_TRANSITIONS,
@@ -95,7 +95,7 @@ export const reservationService = {
     );
 
     const nights = diffNights(checkIn, checkOut);
-    const reservationId = `res-${uuidv4()}`;
+    const reservationId = `res-${randomUUID()}`;
     const reservationCode = await ensureUniqueReservationCode();
 
     const totalUnits = await getTotalUnitsForCategory(
@@ -171,7 +171,7 @@ export const reservationService = {
     );
 
     const nights = diffNights(checkIn, checkOut);
-    const reservationId = `res-${uuidv4()}`;
+    const reservationId = `res-${randomUUID()}`;
     const reservationCode = await ensureUniqueReservationCode();
 
     const totalUnits = await getTotalUnitsForCategory(

@@ -1,4 +1,4 @@
-import { v4 as uuidv4 } from "uuid";
+import { randomUUID } from "crypto";
 import { RatePlan, IRatePlan } from "../models/RatePlan";
 import { getCategories } from "./coreClient";
 
@@ -28,7 +28,7 @@ export const ratePlanService = {
     userId: string
   ): Promise<IRatePlan> {
     const ratePlan = await RatePlan.create({
-      ratePlanId: `rate-${uuidv4()}`,
+      ratePlanId: `rate-${randomUUID()}`,
       ...payload,
       currency: payload.currency?.toUpperCase() ?? "USD",
       isActive: true,
