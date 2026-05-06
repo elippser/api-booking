@@ -1,6 +1,25 @@
 import { Availability } from "../models/Availability";
-import { getCategories } from "./coreClient";
-import { ratePlanService } from "./ratePlanService";
+import type { IPromo } from "../models/Promo";
+import { getCategoriesWithLocalFallback } from "./categoryResilience";
+import {
+  ratePlanService,
+  RATE_PLAN_BASE_FALLBACK_ID,
+  type RatePlanQuote,
+} from "./ratePlanService";
+import { promoService } from "./promoService";
+import { computePricing, AppliedPromo } from "./pricingService";
+
+/** Una fila por plan tarifario activo, ya con promo aplicada (si corresponde). */
+export interface AvailabilityRatePlanOption {
+  ratePlanId: string;
+  name: string;
+  pricePerNight: number;
+  totalAmount: number;
+  currency: string;
+  basePricePerNight: number;
+  appliedPromo?: AppliedPromo;
+  minNights?: number;
+}
 
 export interface AvailabilityResult {
   categoryId: string;
@@ -14,6 +33,46 @@ export interface AvailabilityResult {
   totalAmount: number;
   currency: string;
   nights: number;
+  /** Precio sin promo (igual a pricePerNight si no hay promo aplicada). */
+  basePricePerNight?: number;
+  appliedPromo?: AppliedPromo;
+  /** Planes tarifarios elegibles para la estadía, ordenados del más barato al más caro (total). */
+  ratePlanOptions?: AvailabilityRatePlanOption[];
+}
+
+function buildRatePlanOptions(
+  quotes: RatePlanQuote[],
+  ctx: {
+    propertyId: string;
+    categoryId: string;
+    nights: number;
+    checkIn: Date;
+    candidates: IPromo[];
+  }
+): AvailabilityRatePlanOption[] {
+  const opts: AvailabilityRatePlanOption[] = quotes.map((q) => {
+    const pricing = computePricing({
+      propertyId: ctx.propertyId,
+      categoryId: ctx.categoryId,
+      basePerNight: q.pricePerNight,
+      currency: q.currency,
+      nights: ctx.nights,
+      checkIn: ctx.checkIn,
+      candidates: ctx.candidates,
+    });
+    return {
+      ratePlanId: q.ratePlanId,
+      name: q.name,
+      pricePerNight: pricing.finalPerNight,
+      totalAmount: pricing.finalTotal,
+      currency: q.currency,
+      basePricePerNight: pricing.basePerNight,
+      appliedPromo: pricing.appliedPromo,
+      minNights: q.minNights,
+    };
+  });
+  opts.sort((a, b) => a.totalAmount - b.totalAmount || a.pricePerNight - b.pricePerNight);
+  return opts;
 }
 
 /**
@@ -25,7 +84,8 @@ export async function checkAvailability(
   checkOut: Date,
   adults?: number,
   children?: number,
-  token?: string
+  token?: string,
+  promoCode?: string
 ): Promise<AvailabilityResult[]> {
   const checkInDate = new Date(checkIn);
   const checkOutDate = new Date(checkOut);
@@ -34,10 +94,12 @@ export async function checkAvailability(
     throw new Error("checkOut debe ser posterior a checkIn");
   }
 
-  const categories = await getCategories(propertyId, token);
+  const categories = await getCategoriesWithLocalFallback(propertyId, token);
   if (categories.length === 0) {
     return [];
   }
+
+  const eligiblePromos = await promoService.findEligible(propertyId, promoCode);
 
   const results: AvailabilityResult[] = [];
 
@@ -80,9 +142,9 @@ export async function checkAvailability(
       (checkOutDate.getTime() - checkInDate.getTime()) / (1000 * 60 * 60 * 24)
     );
 
-    let priceInfo: { totalAmount: number; currency: string; pricePerNight: number };
+    let quotes: RatePlanQuote[];
     try {
-      priceInfo = await ratePlanService.getPriceForRange(
+      quotes = await ratePlanService.listPricesForRange(
         propertyId,
         category.categoryId,
         checkInDate,
@@ -91,12 +153,27 @@ export async function checkAvailability(
     } catch {
       const baseAmount = category.basePrice?.amount ?? 0;
       const baseCurrency = category.basePrice?.currency ?? "USD";
-      priceInfo = {
-        totalAmount: baseAmount * nights,
-        currency: baseCurrency,
-        pricePerNight: baseAmount,
-      };
+      quotes = [
+        {
+          ratePlanId: RATE_PLAN_BASE_FALLBACK_ID,
+          name: "Tarifa estándar",
+          pricePerNight: baseAmount,
+          totalAmount: +(baseAmount * nights).toFixed(2),
+          currency: baseCurrency,
+        },
+      ];
     }
+
+    const ratePlanOptions = buildRatePlanOptions(quotes, {
+      propertyId,
+      categoryId: category.categoryId,
+      nights,
+      checkIn: checkInDate,
+      candidates: eligiblePromos,
+    });
+
+    const best = ratePlanOptions[0];
+    if (!best) continue;
 
     results.push({
       categoryId: category.categoryId,
@@ -106,10 +183,13 @@ export async function checkAvailability(
       capacity: category.capacity,
       amenities: category.amenities,
       availableUnits: minAvailable,
-      pricePerNight: priceInfo.pricePerNight,
-      totalAmount: priceInfo.totalAmount,
-      currency: priceInfo.currency,
+      pricePerNight: best.pricePerNight,
+      totalAmount: best.totalAmount,
+      currency: best.currency,
       nights,
+      basePricePerNight: best.basePricePerNight,
+      appliedPromo: best.appliedPromo,
+      ratePlanOptions,
     });
   }
 
@@ -234,9 +314,87 @@ export async function initializeAvailability(
   }
 }
 
+export interface CalendarDay {
+  date: string;
+  availableUnits: number;
+}
+
+export interface CalendarRow {
+  categoryId: string;
+  name: string;
+  totalUnits: number;
+  days: CalendarDay[];
+}
+
+function isoDay(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+/**
+ * Devuelve disponibilidad por categoría para cada día en el rango [from, to].
+ * Si una fecha no tiene Availability doc, asume `totalUnits` libres (sin reservas).
+ */
+export async function getCalendarAvailability(
+  propertyId: string,
+  from: Date,
+  to: Date,
+  token?: string
+): Promise<CalendarRow[]> {
+  const start = new Date(from);
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(to);
+  end.setHours(0, 0, 0, 0);
+
+  if (start > end) return [];
+
+  const categories = await getCategoriesWithLocalFallback(propertyId, token);
+  if (categories.length === 0) return [];
+
+  const docs = await Availability.find({
+    propertyId,
+    categoryId: { $in: categories.map((c) => c.categoryId) },
+    date: { $gte: start, $lte: end },
+  }).lean();
+
+  const docByKey = new Map<string, number>();
+  for (const d of docs) {
+    docByKey.set(`${d.categoryId}|${isoDay(d.date)}`, d.availableUnits);
+  }
+
+  const dates: string[] = [];
+  const cursor = new Date(start);
+  while (cursor <= end) {
+    dates.push(isoDay(cursor));
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  return categories
+    .map((cat) => {
+      const totalUnits = cat.unitCount ?? 0;
+      const days: CalendarDay[] = dates.map((date) => {
+        const stored = docByKey.get(`${cat.categoryId}|${date}`);
+        return {
+          date,
+          availableUnits: stored ?? totalUnits,
+        };
+      });
+      return {
+        categoryId: cat.categoryId,
+        name: cat.name,
+        totalUnits,
+        days,
+      };
+    })
+    .filter((row) => row.totalUnits > 0);
+}
+
 export const availabilityService = {
   checkAvailability,
   decrementAvailability,
   incrementAvailability,
   initializeAvailability,
+  getCalendarAvailability,
 };

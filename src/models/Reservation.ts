@@ -25,6 +25,15 @@ export interface IReservation extends Document {
   cancelledAt?: Date;
   cancelledReason?: string;
   createdByUserId?: string;
+  /** Promo aplicada al cotizar (si la hubo). */
+  appliedPromoId?: string;
+  appliedPromoCode?: string;
+  appliedPromoName?: string;
+  /** Precio por noche sin promo, para reportería. */
+  priceBeforePromo?: number;
+  totalBeforePromo?: number;
+  /** Plan tarifario elegido en el motor (si aplica). */
+  ratePlanId?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -66,6 +75,12 @@ const ReservationSchema = new Schema<IReservation>(
     cancelledAt: { type: Date },
     cancelledReason: { type: String },
     createdByUserId: { type: String },
+    appliedPromoId: { type: String, index: true },
+    appliedPromoCode: { type: String, uppercase: true },
+    appliedPromoName: { type: String },
+    priceBeforePromo: { type: Number, min: 0 },
+    totalBeforePromo: { type: Number, min: 0 },
+    ratePlanId: { type: String, index: true },
   },
   { timestamps: true }
 );

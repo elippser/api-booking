@@ -6,6 +6,7 @@ export const availabilityQuerySchema = Joi.object({
   checkOut: Joi.date().iso().greater(Joi.ref("checkIn")).required(),
   adults: Joi.number().integer().min(1).default(1),
   children: Joi.number().integer().min(0).default(0),
+  promoCode: Joi.string().max(40).allow("").optional(),
 });
 
 export const ratePlanCreateSchema = Joi.object({
@@ -16,16 +17,19 @@ export const ratePlanCreateSchema = Joi.object({
   endDate: Joi.date().iso().min(Joi.ref("startDate")).required(),
   pricePerNight: Joi.number().min(0).required(),
   currency: Joi.string().valid("ARS", "USD", "EUR", "BRL").default("USD"),
-  minNights: Joi.number().integer().min(1),
+  minNights: Joi.number().integer().min(1).allow(null),
+  /** El servicio fija isActive; el front puede enviarlo: sin esto, Joi lo rechazaba. */
+  isActive: Joi.boolean().optional(),
 });
 
 export const ratePlanUpdateSchema = Joi.object({
+  categoryId: Joi.string(),
   name: Joi.string().trim().max(200),
   startDate: Joi.date().iso(),
   endDate: Joi.date().iso(),
   pricePerNight: Joi.number().min(0),
   currency: Joi.string().valid("ARS", "USD", "EUR", "BRL"),
-  minNights: Joi.number().integer().min(1),
+  minNights: Joi.number().integer().min(1).allow(null),
 }).min(1);
 
 export const reservationCreateSchema = Joi.object({
@@ -38,6 +42,8 @@ export const reservationCreateSchema = Joi.object({
   children: Joi.number().integer().min(0).default(0),
   specialRequests: Joi.string().max(1000),
   channel: Joi.string().valid("direct", "phone", "ota"),
+  promoCode: Joi.string().max(40).allow(""),
+  ratePlanId: Joi.string().max(120).allow("", null),
 });
 
 export const reservationMotorCreateSchema = Joi.object({
@@ -48,6 +54,8 @@ export const reservationMotorCreateSchema = Joi.object({
   adults: Joi.number().integer().min(1).required(),
   children: Joi.number().integer().min(0).default(0),
   specialRequests: Joi.string().max(1000).allow(""),
+  promoCode: Joi.string().max(40).allow(""),
+  ratePlanId: Joi.string().max(120).allow("", null),
 }).options({ stripUnknown: true });
 
 export const reservationListQuerySchema = Joi.object({

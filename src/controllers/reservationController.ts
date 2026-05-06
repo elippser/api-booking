@@ -173,8 +173,15 @@ export const createMotorReservation = catchAsync(
 export const listMotorReservations = catchAsync(
   async (req: Request, res: Response): Promise<void> => {
     const guestId = req.guest!.guestId;
+    const propertyIdRaw = req.query.propertyId;
+    const propertyId =
+      typeof propertyIdRaw === "string" && propertyIdRaw.trim().length
+        ? propertyIdRaw.trim()
+        : undefined;
+
     const reservations = await reservationService.listGuestReservations(
-      guestId
+      guestId,
+      { propertyId }
     );
 
     res.status(200).json(reservations);

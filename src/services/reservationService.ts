@@ -1,5 +1,6 @@
 import { randomUUID } from "crypto";
 import { Reservation, IReservation } from "../models/Reservation";
+import { GuestSummary, getGuestSummariesMap } from "../models/Guest";
 import {
   VALID_RESERVATION_TRANSITIONS,
   ReservationStatus,
@@ -12,7 +13,35 @@ import {
 } from "./availabilityService";
 import { ratePlanService } from "./ratePlanService";
 import { Availability } from "../models/Availability";
-import { getCategories, getAvailableUnits, updateUnitStatus } from "./coreClient";
+import { getAvailableUnits, updateUnitStatus } from "./coreClient";
+import { getCategoriesWithLocalFallback } from "./categoryResilience";
+import { resolveBookingPropertyId } from "./propertyResolveService";
+import { promoService } from "./promoService";
+import { computePricing } from "./pricingService";
+
+export type ReservationWithGuest = IReservation & { guest?: GuestSummary };
+
+async function attachGuests(
+  reservations: IReservation[]
+): Promise<ReservationWithGuest[]> {
+  if (reservations.length === 0) return [];
+  const map = await getGuestSummariesMap(reservations.map((r) => r.guestId));
+  return reservations.map((r) => ({
+    ...(r as unknown as Record<string, unknown>),
+    guest: map.get(r.guestId),
+  })) as ReservationWithGuest[];
+}
+
+async function attachGuest(
+  reservation: IReservation | null
+): Promise<ReservationWithGuest | null> {
+  if (!reservation) return null;
+  const map = await getGuestSummariesMap([reservation.guestId]);
+  return {
+    ...(reservation as unknown as Record<string, unknown>),
+    guest: map.get(reservation.guestId),
+  } as ReservationWithGuest;
+}
 
 async function getTotalUnitsForCategory(
   propertyId: string,
@@ -25,7 +54,7 @@ async function getTotalUnitsForCategory(
 
   if (existing) return existing.totalUnits;
 
-  const categories = await getCategories(propertyId);
+  const categories = await getCategoriesWithLocalFallback(propertyId);
   const cat = categories.find((c) => c.categoryId === categoryId);
   return cat?.unitCount ?? 1;
 }
@@ -40,6 +69,89 @@ export interface CreateReservationPayload {
   children?: number;
   specialRequests?: string;
   channel?: ReservationChannel;
+  promoCode?: string;
+  /** Plan tarifario elegido (motor). */
+  ratePlanId?: string;
+}
+
+interface PricedReservation {
+  pricePerNight: number;
+  totalAmount: number;
+  currency: string;
+  basePerNight: number;
+  baseTotal: number;
+  appliedPromoId?: string;
+  appliedPromoCode?: string;
+  appliedPromoName?: string;
+  ratePlanId?: string;
+}
+
+async function priceReservation(
+  payload: CreateReservationPayload,
+  checkIn: Date,
+  checkOut: Date,
+  nights: number
+): Promise<PricedReservation> {
+  const eligible = await promoService.findEligible(payload.propertyId, payload.promoCode);
+
+  let basePerNight: number;
+  let currency: string;
+  let chosenRatePlanId: string | undefined;
+
+  if (payload.ratePlanId) {
+    const quote = await ratePlanService.getQuoteByRatePlanId(
+      payload.ratePlanId,
+      payload.propertyId,
+      payload.categoryId,
+      checkIn,
+      checkOut
+    );
+    if (quote) {
+      basePerNight = quote.pricePerNight;
+      currency = quote.currency;
+      chosenRatePlanId = quote.ratePlanId;
+    } else {
+      const baseInfo = await ratePlanService.getPriceForRange(
+        payload.propertyId,
+        payload.categoryId,
+        checkIn,
+        checkOut
+      );
+      basePerNight = baseInfo.pricePerNight;
+      currency = baseInfo.currency;
+    }
+  } else {
+    const baseInfo = await ratePlanService.getPriceForRange(
+      payload.propertyId,
+      payload.categoryId,
+      checkIn,
+      checkOut
+    );
+    basePerNight = baseInfo.pricePerNight;
+    currency = baseInfo.currency;
+  }
+
+  const pricing = computePricing({
+    propertyId: payload.propertyId,
+    categoryId: payload.categoryId,
+    basePerNight,
+    currency,
+    nights,
+    checkIn,
+    candidates: eligible,
+  });
+
+  return {
+    pricePerNight: pricing.finalPerNight,
+    totalAmount: pricing.finalTotal,
+    currency,
+    basePerNight,
+    baseTotal: +(basePerNight * nights).toFixed(2),
+    appliedPromoId: pricing.appliedPromo?.promoId,
+    appliedPromoCode: pricing.appliedPromo?.code,
+    appliedPromoName: pricing.appliedPromo?.name,
+    ratePlanId: chosenRatePlanId,
+  };
 }
 
 function diffNights(checkIn: Date, checkOut: Date): number {
@@ -47,6 +159,16 @@ function diffNights(checkIn: Date, checkOut: Date): number {
     (new Date(checkOut).getTime() - new Date(checkIn).getTime()) /
       (1000 * 60 * 60 * 24)
   );
+}
+
+// Reservas se persisten con la fecha en UTC midnight (`new Date("YYYY-MM-DD")`),
+// por eso el rango del día se calcula en UTC.
+function dayWindow(value: Date | string): { $gte: Date; $lt: Date } {
+  const start = new Date(value);
+  start.setUTCHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setUTCDate(end.getUTCDate() + 1);
+  return { $gte: start, $lt: end };
 }
 
 async function ensureUniqueReservationCode(): Promise<string> {
@@ -69,38 +191,36 @@ export const reservationService = {
     payload: CreateReservationPayload,
     guestId: string
   ): Promise<IReservation> {
-    const checkIn = new Date(payload.checkIn);
-    const checkOut = new Date(payload.checkOut);
+    const propertyId = await resolveBookingPropertyId(payload.propertyId);
+    const payloadResolved: CreateReservationPayload = { ...payload, propertyId };
+
+    const checkIn = new Date(payloadResolved.checkIn);
+    const checkOut = new Date(payloadResolved.checkOut);
 
     const availability = await availabilityService.checkAvailability(
-      payload.propertyId,
+      propertyId,
       checkIn,
       checkOut,
-      payload.adults,
-      payload.children ?? 0
+      payloadResolved.adults,
+      payloadResolved.children ?? 0
     );
 
     const categoryAvailable = availability.find(
-      (a) => a.categoryId === payload.categoryId
+      (a) => a.categoryId === payloadResolved.categoryId
     );
     if (!categoryAvailable || categoryAvailable.availableUnits < 1) {
       throw new Error("No hay disponibilidad para la categoría seleccionada");
     }
 
-    const priceInfo = await ratePlanService.getPriceForRange(
-      payload.propertyId,
-      payload.categoryId,
-      checkIn,
-      checkOut
-    );
-
     const nights = diffNights(checkIn, checkOut);
+    const priced = await priceReservation(payloadResolved, checkIn, checkOut, nights);
+
     const reservationId = `res-${randomUUID()}`;
     const reservationCode = await ensureUniqueReservationCode();
 
     const totalUnits = await getTotalUnitsForCategory(
-      payload.propertyId,
-      payload.categoryId
+      propertyId,
+      payloadResolved.categoryId
     );
 
     let reservation: IReservation | null = null;
@@ -109,24 +229,30 @@ export const reservationService = {
       reservation = await Reservation.create({
         reservationId,
         reservationCode,
-        propertyId: payload.propertyId,
-        categoryId: payload.categoryId,
+        propertyId,
+        categoryId: payloadResolved.categoryId,
         guestId,
         checkIn,
         checkOut,
         nights,
-        adults: payload.adults,
-        children: payload.children ?? 0,
-        totalAmount: priceInfo.totalAmount,
-        currency: priceInfo.currency,
+        adults: payloadResolved.adults,
+        children: payloadResolved.children ?? 0,
+        totalAmount: priced.totalAmount,
+        currency: priced.currency,
         status: "pending",
         channel: "direct",
-        specialRequests: payload.specialRequests,
+        specialRequests: payloadResolved.specialRequests,
+        appliedPromoId: priced.appliedPromoId,
+        appliedPromoCode: priced.appliedPromoCode,
+        appliedPromoName: priced.appliedPromoName,
+        priceBeforePromo: priced.basePerNight,
+        totalBeforePromo: priced.baseTotal,
+        ratePlanId: priced.ratePlanId,
       });
 
       await availabilityService.decrementAvailability(
-        payload.propertyId,
-        payload.categoryId,
+        propertyId,
+        payloadResolved.categoryId,
         checkIn,
         checkOut,
         totalUnits
@@ -163,14 +289,9 @@ export const reservationService = {
       throw new Error("No hay disponibilidad para la categoría seleccionada");
     }
 
-    const priceInfo = await ratePlanService.getPriceForRange(
-      payload.propertyId,
-      payload.categoryId,
-      checkIn,
-      checkOut
-    );
-
     const nights = diffNights(checkIn, checkOut);
+    const priced = await priceReservation(payload, checkIn, checkOut, nights);
+
     const reservationId = `res-${randomUUID()}`;
     const reservationCode = await ensureUniqueReservationCode();
 
@@ -193,12 +314,18 @@ export const reservationService = {
         nights,
         adults: payload.adults,
         children: payload.children ?? 0,
-        totalAmount: priceInfo.totalAmount,
-        currency: priceInfo.currency,
+        totalAmount: priced.totalAmount,
+        currency: priced.currency,
         status: "confirmed",
         channel: payload.channel ?? "direct",
         specialRequests: payload.specialRequests,
         createdByUserId: userId,
+        appliedPromoId: priced.appliedPromoId,
+        appliedPromoCode: priced.appliedPromoCode,
+        appliedPromoName: priced.appliedPromoName,
+        priceBeforePromo: priced.basePerNight,
+        totalBeforePromo: priced.baseTotal,
+        ratePlanId: priced.ratePlanId,
       });
 
       await availabilityService.decrementAvailability(
@@ -227,40 +354,47 @@ export const reservationService = {
       guestId?: string;
       channel?: ReservationChannel;
     }
-  ): Promise<IReservation[]> {
+  ): Promise<ReservationWithGuest[]> {
     const query: Record<string, unknown> = { propertyId };
 
     if (filters?.status) query.status = filters.status;
     if (filters?.guestId) query.guestId = filters.guestId;
     if (filters?.channel) query.channel = filters.channel;
-    if (filters?.checkIn)
-      query.checkIn = { $gte: new Date(filters.checkIn) };
-    if (filters?.checkOut)
-      query.checkOut = { $lte: new Date(filters.checkOut) };
+    if (filters?.checkIn) query.checkIn = dayWindow(filters.checkIn);
+    if (filters?.checkOut) query.checkOut = dayWindow(filters.checkOut);
 
-    return Reservation.find(query).sort({ checkIn: 1 }).lean() as unknown as Promise<
-      IReservation[]
-    >;
+    const docs = (await Reservation.find(query).sort({ checkIn: 1 }).lean()) as unknown as IReservation[];
+    return attachGuests(docs);
   },
 
-  async listGuestReservations(guestId: string): Promise<IReservation[]> {
-    return Reservation.find({ guestId })
+  async listGuestReservations(
+    guestId: string,
+    filters?: { propertyId?: string }
+  ): Promise<ReservationWithGuest[]> {
+    const query: Record<string, unknown> = { guestId };
+    if (filters?.propertyId) query.propertyId = filters.propertyId;
+
+    const docs = (await Reservation.find(query)
       .sort({ checkIn: -1 })
-      .lean() as unknown as Promise<IReservation[]>;
+      .lean()) as unknown as IReservation[];
+    return attachGuests(docs);
   },
 
-  async getByReservationId(reservationId: string): Promise<IReservation | null> {
-    return Reservation.findOne({ reservationId }).lean() as unknown as Promise<IReservation | null>;
+  async getByReservationId(reservationId: string): Promise<ReservationWithGuest | null> {
+    const doc = (await Reservation.findOne({ reservationId }).lean()) as unknown as IReservation | null;
+    return attachGuest(doc);
   },
 
-  async getByReservationCode(reservationCode: string): Promise<IReservation | null> {
-    return Reservation.findOne({ reservationCode }).lean() as unknown as Promise<IReservation | null>;
+  async getByReservationCode(reservationCode: string): Promise<ReservationWithGuest | null> {
+    const doc = (await Reservation.findOne({ reservationCode }).lean()) as unknown as IReservation | null;
+    return attachGuest(doc);
   },
 
-  async getByIdOrCode(idOrCode: string): Promise<IReservation | null> {
-    const byId = await Reservation.findOne({ reservationId: idOrCode }).lean();
-    if (byId) return byId as unknown as IReservation;
-    return Reservation.findOne({ reservationCode: idOrCode }).lean() as unknown as Promise<IReservation | null>;
+  async getByIdOrCode(idOrCode: string): Promise<ReservationWithGuest | null> {
+    const byId = (await Reservation.findOne({ reservationId: idOrCode }).lean()) as unknown as IReservation | null;
+    if (byId) return attachGuest(byId);
+    const byCode = (await Reservation.findOne({ reservationCode: idOrCode }).lean()) as unknown as IReservation | null;
+    return attachGuest(byCode);
   },
 
   async updateReservationStatus(

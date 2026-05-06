@@ -10,6 +10,7 @@ export const createRatePlan = catchAsync(
   async (req: Request, res: Response): Promise<void> => {
     const { error, value } = ratePlanCreateSchema.validate(req.body, {
       abortEarly: false,
+      stripUnknown: true,
     });
 
     if (error) {
@@ -64,6 +65,7 @@ export const updateRatePlan = catchAsync(
   async (req: Request, res: Response): Promise<void> => {
     const { error, value } = ratePlanUpdateSchema.validate(req.body, {
       abortEarly: false,
+      stripUnknown: true,
     });
 
     if (error) {

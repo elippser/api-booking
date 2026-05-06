@@ -53,7 +53,8 @@ export async function verifyProperty(
 
 /**
  * Obtiene categorías de una propiedad desde rooms-app.
- * Usa el endpoint público (sin auth) cuando no se pasa token.
+ * Sin token: proba la ruta documentada en INTEGRACION-MOTOR-RESERVAS.md primero, luego /public/…
+ * (algunos despliegues sólo exponen una de las dos; antes sólo se llamaba a /public/ y fallaba 404 en silencio).
  */
 export async function getCategories(
   propertyId: string,
@@ -63,21 +64,32 @@ export async function getCategories(
     return [];
   }
 
-  try {
-    const headers: Record<string, string> = {};
-    const url = token
-      ? `${ROOMS_API_URL}/api/v1/properties/${propertyId}/categories`
-      : `${ROOMS_API_URL}/api/v1/public/properties/${propertyId}/categories`;
+  const base = `${ROOMS_API_URL.replace(/\/$/, "")}/api/v1`;
+  const withAuth: Record<string, string> = token
+    ? { Authorization: `Bearer ${token}` }
+    : {};
 
-    if (token) {
-      headers.Authorization = `Bearer ${token}`;
+  const urls = token
+    ? [`${base}/properties/${propertyId}/categories`]
+    : [
+        `${base}/properties/${propertyId}/categories`,
+        `${base}/public/properties/${propertyId}/categories`,
+      ];
+
+  for (const url of urls) {
+    try {
+      const { data } = await axios.get<CoreCategory[]>(url, {
+        headers: withAuth,
+        validateStatus: (s) => s === 200,
+      });
+      if (Array.isArray(data)) {
+        return data;
+      }
+    } catch {
+      /* probar siguiente URL */
     }
-
-    const { data } = await axios.get<CoreCategory[]>(url, { headers });
-    return Array.isArray(data) ? data : [];
-  } catch {
-    return [];
   }
+  return [];
 }
 
 /**

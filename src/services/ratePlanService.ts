@@ -1,6 +1,6 @@
 import { randomUUID } from "crypto";
 import { RatePlan, IRatePlan } from "../models/RatePlan";
-import { getCategories } from "./coreClient";
+import { getCategoriesWithLocalFallback } from "./categoryResilience";
 
 export interface CreateRatePlanPayload {
   propertyId: string;
@@ -14,6 +14,7 @@ export interface CreateRatePlanPayload {
 }
 
 export interface UpdateRatePlanPayload {
+  categoryId?: string;
   name?: string;
   startDate?: Date;
   endDate?: Date;
@@ -21,6 +22,18 @@ export interface UpdateRatePlanPayload {
   currency?: string;
   minNights?: number;
 }
+
+/** Cotización base (sin promo) por plan tarifario para un rango de estadía. */
+export interface RatePlanQuote {
+  ratePlanId: string;
+  name: string;
+  pricePerNight: number;
+  totalAmount: number;
+  currency: string;
+  minNights?: number;
+}
+
+export const RATE_PLAN_BASE_FALLBACK_ID = "__base__";
 
 export const ratePlanService = {
   async create(
@@ -64,6 +77,7 @@ export const ratePlanService = {
     const ratePlan = await RatePlan.findOne({ ratePlanId });
     if (!ratePlan) return null;
 
+    if (payload.categoryId !== undefined) ratePlan.categoryId = payload.categoryId;
     if (payload.name !== undefined) ratePlan.name = payload.name;
     if (payload.startDate !== undefined) ratePlan.startDate = payload.startDate;
     if (payload.endDate !== undefined) ratePlan.endDate = payload.endDate;
@@ -84,6 +98,62 @@ export const ratePlanService = {
     );
   },
 
+  /**
+   * Todos los planes activos que cubren el rango [checkIn, checkOut) y cumplen minNights.
+   * Ordenados por precio/noche ascendente. Si no hay planes, un ítem sintético con precio de categoría.
+   */
+  async listPricesForRange(
+    propertyId: string,
+    categoryId: string,
+    checkIn: Date,
+    checkOut: Date
+  ): Promise<RatePlanQuote[]> {
+    const checkInDate = new Date(checkIn);
+    const checkOutDate = new Date(checkOut);
+    const nights = Math.ceil(
+      (checkOutDate.getTime() - checkInDate.getTime()) / (1000 * 60 * 60 * 24)
+    );
+
+    const plans = await RatePlan.find({
+      propertyId,
+      categoryId,
+      isActive: true,
+      startDate: { $lte: checkInDate },
+      endDate: { $gte: checkOutDate },
+    })
+      .sort({ pricePerNight: 1 })
+      .lean();
+
+    const out: RatePlanQuote[] = [];
+    for (const p of plans) {
+      if (p.minNights != null && p.minNights > nights) continue;
+      out.push({
+        ratePlanId: p.ratePlanId,
+        name: p.name,
+        pricePerNight: p.pricePerNight,
+        totalAmount: +(p.pricePerNight * nights).toFixed(2),
+        currency: p.currency,
+        minNights: p.minNights ?? undefined,
+      });
+    }
+
+    if (out.length === 0) {
+      const categories = await getCategoriesWithLocalFallback(propertyId);
+      const category = categories.find((c) => c.categoryId === categoryId);
+      const baseAmount = category?.basePrice?.amount ?? 0;
+      const baseCurrency = category?.basePrice?.currency ?? "USD";
+      out.push({
+        ratePlanId: RATE_PLAN_BASE_FALLBACK_ID,
+        name: "Tarifa estándar",
+        pricePerNight: baseAmount,
+        totalAmount: +(baseAmount * nights).toFixed(2),
+        currency: baseCurrency,
+      });
+    }
+
+    return out;
+  },
+
   async getPriceForRange(
     propertyId: string,
     categoryId: string,
@@ -94,37 +164,55 @@ export const ratePlanService = {
     currency: string;
     pricePerNight: number;
   }> {
+    const quotes = await this.listPricesForRange(propertyId, categoryId, checkIn, checkOut);
+    const first = quotes[0];
+    return {
+      totalAmount: first.totalAmount,
+      currency: first.currency,
+      pricePerNight: first.pricePerNight,
+    };
+  },
+
+  /**
+   * Precio base para una reserva cuando el huésped eligió un plan concreto.
+   */
+  async getQuoteByRatePlanId(
+    ratePlanId: string,
+    propertyId: string,
+    categoryId: string,
+    checkIn: Date,
+    checkOut: Date
+  ): Promise<RatePlanQuote | null> {
+    if (!ratePlanId || ratePlanId === RATE_PLAN_BASE_FALLBACK_ID) {
+      const list = await this.listPricesForRange(propertyId, categoryId, checkIn, checkOut);
+      return list.find((q) => q.ratePlanId === RATE_PLAN_BASE_FALLBACK_ID) ?? list[0] ?? null;
+    }
+
     const checkInDate = new Date(checkIn);
     const checkOutDate = new Date(checkOut);
     const nights = Math.ceil(
       (checkOutDate.getTime() - checkInDate.getTime()) / (1000 * 60 * 60 * 24)
     );
 
-    const ratePlan = await RatePlan.findOne({
+    const p = await RatePlan.findOne({
+      ratePlanId,
       propertyId,
       categoryId,
       isActive: true,
       startDate: { $lte: checkInDate },
       endDate: { $gte: checkOutDate },
-    }).sort({ pricePerNight: 1 });
+    }).lean();
 
-    if (ratePlan && (!ratePlan.minNights || ratePlan.minNights <= nights)) {
-      return {
-        totalAmount: ratePlan.pricePerNight * nights,
-        currency: ratePlan.currency,
-        pricePerNight: ratePlan.pricePerNight,
-      };
-    }
-
-    const categories = await getCategories(propertyId);
-    const category = categories.find((c) => c.categoryId === categoryId);
-    const baseAmount = category?.basePrice?.amount ?? 0;
-    const baseCurrency = category?.basePrice?.currency ?? "USD";
+    if (!p) return null;
+    if (p.minNights != null && p.minNights > nights) return null;
 
     return {
-      totalAmount: baseAmount * nights,
-      currency: baseCurrency,
-      pricePerNight: baseAmount,
+      ratePlanId: p.ratePlanId,
+      name: p.name,
+      pricePerNight: p.pricePerNight,
+      totalAmount: +(p.pricePerNight * nights).toFixed(2),
+      currency: p.currency,
+      minNights: p.minNights ?? undefined,
     };
   },
 };
