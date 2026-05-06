@@ -1,4 +1,5 @@
 import { randomUUID } from "crypto";
+import type { Document } from "mongoose";
 import { Promo, IPromo, derivePromoStatus, PromoStatus } from "../models/Promo";
 
 export interface PromoSummary extends Omit<IPromo, "$assertPopulated" | "save" | "remove" | "validate" | "$where" | keyof Document> {
